@@ -98,7 +98,7 @@
       background: rgba(8, 11, 18, 0.92);
       backdrop-filter: blur(18px);
       overflow-y: auto;
-      z-index: 10;
+      z-index: 1001;
     }
 
     .nav-brand {
@@ -268,6 +268,34 @@
       color: var(--muted-2);
       font-size: 11px;
       line-height: 1.65;
+    }
+
+    .nav-backtest {
+      margin: 14px 9px 0;
+      padding: 12px;
+      border: 1px solid rgba(96, 165, 250, .35);
+      border-radius: 10px;
+      background: rgba(59, 130, 246, .10);
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 11px;
+    }
+    .nav-backtest .backtest-setting-head strong {
+      color: var(--text);
+      font-size: 12px;
+    }
+    .nav-backtest .backtest-toggle {
+      font-size: 11px;
+    }
+    .nav-backtest p {
+      margin: 8px 0 0;
+      color: var(--muted-2);
+    }
+    .nav-backtest .backtest-setting-status {
+      margin-top: 8px;
+      color: var(--muted-2);
+      font-size: 10px;
+      line-height: 1.5;
     }
 
     button,
@@ -1200,12 +1228,14 @@
     .page-loading {
       position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center;
       background: rgba(8, 15, 30, .32); backdrop-filter: blur(3px);
+      pointer-events: none;
     }
     .page-loading[hidden] { display: none; }
     .page-loading-card {
       min-width: 250px; padding: 24px 28px; text-align: center;
       border: 1px solid rgba(99, 175, 255, .3); border-radius: 14px;
       background: rgba(17, 29, 50, .92); color: #dce9ff; box-shadow: 0 16px 45px rgba(0,0,0,.18);
+      pointer-events: auto;
     }
     .page-loading-spinner {
       width: 30px; height: 30px; margin: 0 auto 12px; border: 3px solid rgba(255,255,255,.18);
@@ -1887,6 +1917,49 @@
     .recommendation-note .model-note-head span { display: none; }
     .recommendation-note p { margin: 7px 0 0; }
 
+    .backtest-setting {
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 12px;
+      background: rgba(59, 130, 246, .06);
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 13px;
+    }
+    .backtest-setting-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .backtest-setting-head strong { color: var(--text); font-size: 13px; }
+    .backtest-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      user-select: none;
+    }
+    .backtest-toggle input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--blue);
+      cursor: pointer;
+    }
+    .backtest-setting p {
+      margin: 8px 0 0;
+      font-size: 12px;
+    }
+    .backtest-setting-status {
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--muted-2);
+    }
+
     .empty {
       padding: 22px;
       text-align: center;
@@ -2105,6 +2178,11 @@
 
     :root[data-theme="light"] body {
       background: var(--bg);
+    }
+
+    :root[data-theme="light"] .nav-backtest {
+      background: #eef6ff;
+      border-color: #b9d4f2;
     }
 
     :root[data-theme="light"] .nav-rail {
@@ -2503,6 +2581,17 @@
           <span>指数分析</span><span class="nav-count">实时</span>
         </button>
       </nav>
+      <div class="nav-backtest backtest-setting" aria-label="概率回测设置">
+        <div class="backtest-setting-head">
+          <strong>概率回测</strong>
+          <label class="backtest-toggle" for="probabilityBacktestToggle">
+            <input id="probabilityBacktestToggle" type="checkbox">
+            <span id="probabilityBacktestLabel">关闭</span>
+          </label>
+        </div>
+        <p id="probabilityBacktestHint">关闭时不建立全市场历史样本，也不做收盘候选保存；后续上涨概率仅显示启发式参考。</p>
+        <div class="backtest-setting-status" id="probabilityBacktestStatus">状态：读取中</div>
+      </div>
       <div class="nav-foot">每次仅扫描所选市场的实时快照。入选候选在打开图表时按需加载历史 K 线。</div>
     </aside>
 
@@ -3046,6 +3135,15 @@
       midtermPoolCount: 0,
       midtermEligibleCount: 0,
       midtermScan: { status: "idle", total: 0, processed: 0, added: 0, failed: 0 },
+      probabilityBacktest: {
+        enabled: false,
+        loading: true,
+        saving: false,
+        samples: 0,
+        target: "未来 10 个交易日最高价较信号日收盘上涨至少 5%",
+        status: null,
+        message: ""
+      },
       detailLoadingCode: null,
       conceptLoadingCode: null,
       stockClickTimer: null,
@@ -3110,6 +3208,10 @@
       recommendationReason: document.getElementById("recommendationReason"),
       recommendationReasonScore: document.getElementById("recommendationReasonScore"),
       recommendationReasonTitle: document.getElementById("recommendationReasonTitle"),
+      probabilityBacktestToggle: document.getElementById("probabilityBacktestToggle"),
+      probabilityBacktestLabel: document.getElementById("probabilityBacktestLabel"),
+      probabilityBacktestHint: document.getElementById("probabilityBacktestHint"),
+      probabilityBacktestStatus: document.getElementById("probabilityBacktestStatus"),
       resultTag: document.getElementById("resultTag"),
       stockList: document.getElementById("stockList"),
       detailContent: document.getElementById("detailContent"),
@@ -3919,7 +4021,106 @@
           : state.sectors.find((sector) => sector.key === payload.sector.key);
         if (target) Object.assign(target, payload.sector);
       }
+      if (payload.followUpBacktest) {
+        state.probabilityBacktest.enabled = Boolean(payload.followUpBacktest.enabled);
+        state.probabilityBacktest.samples = Number(payload.followUpBacktest.samples) || 0;
+        if (payload.followUpBacktest.target) state.probabilityBacktest.target = payload.followUpBacktest.target;
+      }
       syncDynamicControls();
+      renderBacktestSettings();
+    }
+
+    function applyBacktestSettingsPayload(payload) {
+      if (!payload || typeof payload !== "object") return;
+      state.probabilityBacktest.enabled = Boolean(payload.enabled);
+      state.probabilityBacktest.samples = Number(payload.samples) || 0;
+      state.probabilityBacktest.target = payload.target || state.probabilityBacktest.target;
+      state.probabilityBacktest.status = payload.allMarketBacktest || null;
+      state.probabilityBacktest.message = payload.allMarketBacktest?.message || "";
+      renderBacktestSettings();
+    }
+
+    function backtestStatusText() {
+      const item = state.probabilityBacktest;
+      if (item.loading) return "状态：读取中";
+      if (item.saving) return "状态：保存中";
+      if (!item.enabled) {
+        return `状态：已关闭 · 当前样本 ${item.samples.toLocaleString("zh-CN")} 条`;
+      }
+      const backtest = item.status || {};
+      const progress = backtest.processed != null && backtest.total
+        ? ` · 进度 ${backtest.processed}/${backtest.total}`
+        : "";
+      const statusLabel = ({
+        running: "后台建立样本中",
+        completed: "样本已就绪",
+        stopped: "已停止",
+        error: "运行失败",
+        idle: "等待启动",
+        disabled: "已关闭"
+      })[backtest.status || "idle"] || backtest.status || "已开启";
+      return `状态：${statusLabel}${progress} · 样本 ${item.samples.toLocaleString("zh-CN")} 条 · 目标 ${item.target}`;
+    }
+
+    function renderBacktestSettings() {
+      if (!el.probabilityBacktestToggle) return;
+      const item = state.probabilityBacktest;
+      if (document.activeElement !== el.probabilityBacktestToggle) {
+        el.probabilityBacktestToggle.checked = item.enabled;
+      }
+      el.probabilityBacktestToggle.disabled = item.saving;
+      el.probabilityBacktestLabel.textContent = item.enabled ? "开启" : "关闭";
+      el.probabilityBacktestHint.textContent = item.enabled
+        ? "开启后将在后台分批建立全市场历史样本，并在交易日收盘后保存候选参与后续上涨概率校准；会占用 CPU 与网络。"
+        : "关闭时不建立全市场历史样本，也不做收盘候选保存；后续上涨概率仅显示启发式参考。";
+      el.probabilityBacktestStatus.textContent = backtestStatusText();
+    }
+
+    async function loadBacktestSettings(options = {}) {
+      const silent = options.silent === true;
+      if (!silent) {
+        state.probabilityBacktest.loading = true;
+        renderBacktestSettings();
+      }
+      try {
+        const response = await fetch("/api/backtest-settings", { cache: "no-store" });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+        applyBacktestSettingsPayload(payload);
+      } catch (error) {
+        state.probabilityBacktest.message = error.message || "无法读取概率回测配置";
+        if (!silent) {
+          el.probabilityBacktestStatus.textContent = `状态：读取失败 · ${state.probabilityBacktest.message}`;
+        }
+      } finally {
+        if (!silent) {
+          state.probabilityBacktest.loading = false;
+          renderBacktestSettings();
+        } else {
+          el.probabilityBacktestStatus.textContent = backtestStatusText();
+        }
+      }
+    }
+
+    async function saveBacktestSettings(enabled) {
+      if (state.probabilityBacktest.saving) return;
+      state.probabilityBacktest.enabled = enabled;
+      state.probabilityBacktest.saving = true;
+      renderBacktestSettings();
+      try {
+        const query = new URLSearchParams({ enabled: enabled ? "1" : "0" });
+        const response = await fetch(`/api/backtest-settings?${query}`, { cache: "no-store" });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+        applyBacktestSettingsPayload(payload);
+        if (state.pageView === "screener" && stocks.length) loadMarketData(true);
+      } catch (error) {
+        state.probabilityBacktest.enabled = !enabled;
+        el.probabilityBacktestStatus.textContent = `状态：保存失败 · ${error.message || "请稍后重试"}`;
+      } finally {
+        state.probabilityBacktest.saving = false;
+        renderBacktestSettings();
+      }
     }
 
     async function loadMarketData(forceRefresh = false) {
@@ -5684,6 +5885,11 @@
       if (event.key === "Escape" && state.chartOpen) requestChartClose();
     });
 
+    el.probabilityBacktestToggle?.addEventListener("change", () => {
+      if (state.probabilityBacktest.saving) return;
+      saveBacktestSettings(el.probabilityBacktestToggle.checked);
+    });
+
     [el.strategy, el.sortBy].forEach((control) => {
       control.addEventListener("input", () => {
         updateFromControls();
@@ -5756,10 +5962,17 @@
           loadIndexAnalysis();
         }
       }
+      if (state.probabilityBacktest.enabled && state.probabilityBacktest.status?.status === "running") {
+        if (!window.backtestSettingsNextAt || Date.now() >= window.backtestSettingsNextAt) {
+          window.backtestSettingsNextAt = Date.now() + 5000;
+          loadBacktestSettings({ silent: true });
+        }
+      }
     }, 1000);
 
     applyTheme(savedTheme(), false);
     render();
+    loadBacktestSettings();
     loadSectors();
     loadMarketIndices();
   </script>

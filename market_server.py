@@ -65,6 +65,7 @@ SUPPLEMENT_REQUEST_TIMEOUT_SECONDS = 5
 MARKET_PAGE_SIZE = 100
 AUCTION_DATA_DIR = BASE_DIR / "data" / "auction"
 BACKTEST_DB_PATH = BASE_DIR / "data" / "backtest.sqlite"
+BACKTEST_SETTINGS_PATH = BASE_DIR / "data" / "backtest_settings.json"
 THRESHOLD_TIMES_PATH = BASE_DIR / "data" / "threshold_times.json"
 BACKTEST_LOOKBACK_DAYS = 30
 BACKTEST_HORIZON_DAYS = 10
@@ -119,7 +120,6 @@ HOT_CONCEPT_FIXED_BOARDS: Dict[str, Tuple[str, str]] = {
 # It must print an EMT get_open_call_auction JSON result for the whole A-share universe.
 # Example: EMT_AUCTION_COMMAND='python3 /path/to/export_emt_auction.py --date {date}'
 EMT_AUCTION_COMMAND = os.environ.get("EMT_AUCTION_COMMAND", "").strip()
-ENABLE_ALL_MARKET_BACKTEST = os.environ.get("ENABLE_ALL_MARKET_BACKTEST", "").strip().lower() in ("1", "true", "yes")
 _HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://finance.sina.com.cn/",
@@ -296,6 +296,12 @@ _prediction_threshold_names: Dict[Tuple[str, str, int], str] = {}
 _prediction_threshold_quotes: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
 _change_threshold_times: Dict[Tuple[str, str, int], str] = {}
 _score_observations: Dict[Tuple[str, str], Tuple[float, float]] = {}
+_backtest_settings_lock = threading.Lock()
+_backtest_control_lock = threading.Lock()
+_backtest_stop_event = threading.Event()
+_backtest_thread: Optional[threading.Thread] = None
+_probability_backtest_enabled = False
+FOLLOW_UP_BACKTEST_TARGET = "未来 10 个交易日最高价较信号日收盘上涨至少 5%"
 
 
 def load_threshold_times() -> None:
@@ -340,7 +346,138 @@ def persist_threshold_times() -> None:
     temporary.replace(THRESHOLD_TIMES_PATH)
 
 
+def _default_backtest_settings() -> Dict[str, Any]:
+    env_default = os.environ.get("ENABLE_ALL_MARKET_BACKTEST", "").strip().lower() in ("1", "true", "yes")
+    return {
+        "probabilityBacktestEnabled": env_default,
+        "updatedAt": datetime.now(CHINA_TZ).isoformat(),
+    }
+
+
+def load_backtest_settings() -> Dict[str, Any]:
+    global _probability_backtest_enabled
+    BACKTEST_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = _default_backtest_settings()
+    if BACKTEST_SETTINGS_PATH.exists():
+        try:
+            stored = json.loads(BACKTEST_SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(stored, dict):
+                payload["probabilityBacktestEnabled"] = bool(stored.get("probabilityBacktestEnabled"))
+                if stored.get("updatedAt"):
+                    payload["updatedAt"] = str(stored["updatedAt"])
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+    else:
+        BACKTEST_SETTINGS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _probability_backtest_enabled = bool(payload["probabilityBacktestEnabled"])
+    return payload
+
+
+def save_backtest_settings(enabled: bool) -> Dict[str, Any]:
+    global _probability_backtest_enabled
+    payload = {
+        "probabilityBacktestEnabled": enabled,
+        "updatedAt": datetime.now(CHINA_TZ).isoformat(),
+    }
+    BACKTEST_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BACKTEST_SETTINGS_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _probability_backtest_enabled = enabled
+    return payload
+
+
+def is_probability_backtest_enabled() -> bool:
+    return _probability_backtest_enabled
+
+
+def disabled_backtest_status_message() -> str:
+    return "概率回测已关闭；开启后将在后台建立全市场历史样本，并在收盘后保存候选参与后续上涨概率校准"
+
+
+def ensure_all_market_backtest_running() -> None:
+    global _backtest_thread
+    if not is_probability_backtest_enabled():
+        return
+    with _backtest_control_lock:
+        if _all_market_backtest_status.get("status") == "running":
+            return
+        if _backtest_thread and _backtest_thread.is_alive():
+            return
+        _backtest_stop_event.clear()
+        _backtest_thread = threading.Thread(target=run_all_market_backtest, name="all-market-backtest", daemon=True)
+        _backtest_thread.start()
+
+
+def set_probability_backtest_enabled(enabled: bool) -> Dict[str, Any]:
+    global _all_market_backtest_status
+    with _backtest_settings_lock:
+        save_backtest_settings(enabled)
+    if enabled:
+        _backtest_stop_event.clear()
+        if _all_market_backtest_status.get("status") in ("disabled", "stopped", "idle"):
+            _all_market_backtest_status = {
+                "status": "idle",
+                "total": 0,
+                "processed": 0,
+                "records": 0,
+                "failed": 0,
+                "message": "等待启动全市场历史回测",
+            }
+        ensure_all_market_backtest_running()
+    else:
+        _backtest_stop_event.set()
+        current = dict(_all_market_backtest_status)
+        if current.get("status") == "running":
+            current.update({
+                "status": "stopped",
+                "message": "已在页面关闭概率回测",
+                "updatedAt": datetime.now(CHINA_TZ).isoformat(),
+            })
+        else:
+            current = {
+                "status": "disabled",
+                "total": int(current.get("total") or 0),
+                "processed": int(current.get("processed") or 0),
+                "records": int(current.get("records") or 0),
+                "failed": int(current.get("failed") or 0),
+                "message": disabled_backtest_status_message(),
+            }
+        _all_market_backtest_status = current
+    return get_backtest_settings_payload()
+
+
+def get_backtest_settings_payload() -> Dict[str, Any]:
+    summary = load_follow_up_calibration_summary()
+    status = dict(_all_market_backtest_status)
+    if not is_probability_backtest_enabled() and status.get("status") not in ("running", "completed"):
+        status.setdefault("message", disabled_backtest_status_message())
+        status["status"] = "disabled" if status.get("status") != "stopped" else "stopped"
+    updated_at = None
+    try:
+        if BACKTEST_SETTINGS_PATH.exists():
+            stored = json.loads(BACKTEST_SETTINGS_PATH.read_text(encoding="utf-8"))
+            updated_at = stored.get("updatedAt")
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        updated_at = None
+    return {
+        "enabled": is_probability_backtest_enabled(),
+        "updatedAt": updated_at,
+        "target": FOLLOW_UP_BACKTEST_TARGET,
+        "samples": summary.get("samples", 0),
+        "allMarketBacktest": status,
+    }
+
+
 load_threshold_times()
+load_backtest_settings()
+if not is_probability_backtest_enabled():
+    _all_market_backtest_status = {
+        "status": "disabled",
+        "total": 0,
+        "processed": 0,
+        "records": 0,
+        "failed": 0,
+        "message": disabled_backtest_status_message(),
+    }
 
 
 class MarketDataError(RuntimeError):
@@ -513,6 +650,8 @@ def follow_up_snapshot_loop(stop_event: threading.Event) -> None:
     captured_dates: set[str] = set()
     last_intraday_scan = 0.0
     while not stop_event.wait(30):
+        if not is_probability_backtest_enabled():
+            continue
         now = datetime.now(CHINA_TZ)
         if now.weekday() >= 5:
             continue
@@ -1843,6 +1982,8 @@ def fetch_hot_concept_data(concept_name: str) -> Dict[str, Any]:
     sector_strength = aggregate_sector_strength(quotes)
     add_order_flow_factors(screened, sector_strength)
     add_probability_models(screened, sector_strength, updated_at.strftime("%Y-%m-%d"))
+    if is_probability_backtest_enabled():
+        apply_follow_up_calibration(screened, load_follow_up_calibration_summary())
     screened.sort(key=lambda item: (item.get("probability", {}).get("todayLimitUp", 0), item.get("changePct", 0)), reverse=True)
     for quote in screened:
         quote["relatedSectors"] = [concept_name]
@@ -1980,8 +2121,10 @@ def fetch_dynamic_market_data(
     if not include_all:
         add_order_flow_factors(final_quotes, sector_strength)
     add_probability_models(final_quotes, sector_strength, updated_at.strftime("%Y-%m-%d"))
-    calibration = {"samples": 0, "updatedAt": datetime.now(CHINA_TZ).isoformat()}
-    # 回测写入在后台任务中进行，不阻塞盘中实时行情首屏。
+    if is_probability_backtest_enabled():
+        calibration = load_follow_up_calibration_summary()
+    else:
+        calibration = {"samples": 0, "rates": {}, "updatedAt": datetime.now(CHINA_TZ).isoformat()}
     apply_follow_up_calibration(final_quotes, calibration)
     # 人气与关联概念互不依赖，合并并发请求，全部完成后再一次性返回页面。
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -2014,8 +2157,9 @@ def fetch_dynamic_market_data(
             "rule": "大盘平均涨跌幅≤-1.5%视为超跌，否则最低综合分70。",
         },
         "followUpBacktest": {
+            "enabled": is_probability_backtest_enabled(),
             "samples": calibration["samples"],
-            "target": "未来 10 个交易日最高价较信号日收盘上涨至少 5%",
+            "target": FOLLOW_UP_BACKTEST_TARGET,
             "updatedAt": calibration["updatedAt"],
         },
         "unavailableCodes": [],
@@ -2965,6 +3109,15 @@ def build_follow_up_calibration(quotes: List[Dict[str, Any]], trade_date: str) -
                         (quote["code"], trade_date, int(probability.get("rawFollowUp") or 0)),
                     )
             connection.commit()
+        finally:
+            connection.close()
+    return load_follow_up_calibration_summary()
+
+
+def load_follow_up_calibration_summary() -> Dict[str, Any]:
+    with _backtest_lock:
+        connection = open_backtest_db()
+        try:
             rows = connection.execute("SELECT score, outcome FROM follow_up_observations").fetchall()
         finally:
             connection.close()
@@ -2986,7 +3139,7 @@ def apply_follow_up_calibration(quotes: List[Dict[str, Any]], calibration: Dict[
         if empirical is not None and sample_count >= 30:
             probability["followUp"] = int(round(raw * .35 + empirical * .65))
         probability["backtestSamples"] = sample_count
-        probability["target"] = "未来 10 个交易日最高价较信号日收盘上涨至少 5%"
+        probability["target"] = FOLLOW_UP_BACKTEST_TARGET
 
 
 def run_all_market_backtest() -> None:
@@ -3025,6 +3178,13 @@ def run_all_market_backtest() -> None:
             return code, observations
 
         for start in range(0, len(pending), 40):
+            if _backtest_stop_event.is_set() or not is_probability_backtest_enabled():
+                _all_market_backtest_status.update({
+                    "status": "stopped",
+                    "message": "已在页面关闭概率回测",
+                    "updatedAt": datetime.now(CHINA_TZ).isoformat(),
+                })
+                return
             batch = pending[start:start + 40]
             with ThreadPoolExecutor(max_workers=6) as executor:
                 results = list(executor.map(build_rows, batch))
@@ -3047,24 +3207,6 @@ def run_all_market_backtest() -> None:
     except (MarketDataError, OSError, sqlite3.Error, ValueError) as exc:
         _all_market_backtest_status.update({"status": "error", "message": str(exc)})
         print(f"全市场历史回测失败: {exc}")
-
-
-def all_market_backtest_loop(stop_event: threading.Event) -> None:
-    """Run the initial full-market job once after service startup."""
-    global _all_market_backtest_status
-    if not ENABLE_ALL_MARKET_BACKTEST:
-        _all_market_backtest_status = {
-            "status": "disabled",
-            "total": 0,
-            "processed": 0,
-            "records": 0,
-            "failed": 0,
-            "message": "未启用；设置 ENABLE_ALL_MARKET_BACKTEST=1 后重启可后台建立全市场回测样本",
-        }
-        return
-    if stop_event.wait(3):
-        return
-    run_all_market_backtest()
 
 
 def limit_up_candidate_score(
@@ -3389,7 +3531,24 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_html()
             return
         if parsed.path == "/api/health":
-            self.send_json(200, {"status": "ok", "version": 11, "allMarketBacktest": _all_market_backtest_status})
+            self.send_json(200, {
+                "status": "ok",
+                "version": 11,
+                "probabilityBacktestEnabled": is_probability_backtest_enabled(),
+                "allMarketBacktest": _all_market_backtest_status,
+            })
+            return
+        if parsed.path == "/api/backtest-settings":
+            enabled_param = query.get("enabled", [None])[0]
+            if enabled_param is not None:
+                normalized = str(enabled_param).strip().lower()
+                if normalized not in ("0", "1", "false", "true", "no", "yes"):
+                    self.send_json(400, {"error": "enabled 参数应为 0 或 1"})
+                    return
+                payload = set_probability_backtest_enabled(normalized in ("1", "true", "yes"))
+            else:
+                payload = get_backtest_settings_payload()
+            self.send_json(200, payload)
             return
         if parsed.path == "/api/score-alerts":
             trade_date = datetime.now(CHINA_TZ).strftime("%Y-%m-%d")
@@ -3597,17 +3756,18 @@ def main() -> None:
     capture_stop = threading.Event()
     threading.Thread(target=auction_capture_loop, args=(capture_stop,), name="auction-capture", daemon=True).start()
     threading.Thread(target=follow_up_snapshot_loop, args=(capture_stop,), name="follow-up-snapshot", daemon=True).start()
-    threading.Thread(target=all_market_backtest_loop, args=(capture_stop,), name="all-market-backtest", daemon=True).start()
+    if is_probability_backtest_enabled():
+        ensure_all_market_backtest_running()
     print(f"TradingAgents 板块选股工作台已启动: http://{args.host}:{args.port}/")
     if EMT_AUCTION_COMMAND:
         print("EMT 竞价采集已配置：交易日 09:25 后将自动保存竞价快照")
     else:
         print("EMT 竞价采集未配置：涨停复盘将把竞价委买因子标为待接入")
-    print("后续上涨模型将在交易日 15:05 后保存当日候选，并在满 10 个交易日后自动校准")
-    if ENABLE_ALL_MARKET_BACKTEST:
-        print("全市场历史回测已在后台启动：已完成股票将自动跳过，支持断点续跑")
+    print("后续上涨概率回测可在页面「模型权重」区开启或关闭")
+    if is_probability_backtest_enabled():
+        print("概率回测已开启：全市场历史样本将在后台建立，收盘后保存候选参与校准")
     else:
-        print("全市场历史回测默认关闭：如需后台建立样本，请设置 ENABLE_ALL_MARKET_BACKTEST=1")
+        print("概率回测默认关闭：可在页面开启，避免后台占用 CPU 与网络")
     print("按 Ctrl+C 停止服务")
     try:
         server.serve_forever()
