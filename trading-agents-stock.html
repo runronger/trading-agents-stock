@@ -3397,7 +3397,7 @@
       hotGroupRefreshTimer = null;
       if (el.hotSectorGroups.hidden) return;
       const delay = document.hidden ? 90000 : 30000;
-      hotGroupRefreshTimer = window.setTimeout(() => loadHotSectorSummaries(true), delay);
+      hotGroupRefreshTimer = window.setTimeout(() => loadHotSectorSummaries(false), delay);
     }
 
     async function loadHotGroupSummary(group, forceRefresh = false) {
@@ -3733,7 +3733,7 @@
       }
       const delay = document.hidden ? LIMIT_UP_REFRESH_BACKGROUND_MS : LIMIT_UP_REFRESH_FOREGROUND_MS;
       limitUpRefreshNextAt = Date.now() + delay;
-      limitUpRefreshTimer = window.setTimeout(() => refreshLimitUpNow(true), delay);
+      limitUpRefreshTimer = window.setTimeout(() => refreshLimitUpNow(false), delay);
       renderLimitUpStatus();
     }
 
@@ -3795,7 +3795,7 @@
           scheduleScreenerRefresh();
           return;
         }
-        loadMarketData(true);
+        loadMarketData(false);
       }, delay);
       syncDynamicControls();
     }
@@ -3837,7 +3837,7 @@
       }
       const delay = document.hidden ? SECTOR_REFRESH_BACKGROUND_MS : SECTOR_REFRESH_FOREGROUND_MS;
       sectorRefreshNextAt = Date.now() + delay;
-      sectorRefreshTimer = window.setTimeout(() => refreshSectorStrengthNow(true), delay);
+      sectorRefreshTimer = window.setTimeout(() => refreshSectorStrengthNow(false), delay);
       renderSectorRefreshStatus();
     }
 
@@ -5461,6 +5461,30 @@
       }
     }
 
+    let filterRenderTimer = null;
+
+    function renderFilteredResults() {
+      el.scoreValue.textContent = state.minScore;
+      renderWeights();
+      const list = filteredStocks();
+      renderStats(list);
+      renderList(list);
+      if (state.pageView !== "hot-concept") {
+        renderSelectionReason(list);
+        if (state.selectedCode && list.some((stock) => stock.code === state.selectedCode)) {
+          renderDetail(list);
+        }
+      }
+    }
+
+    function scheduleFilterRender() {
+      if (filterRenderTimer !== null) window.clearTimeout(filterRenderTimer);
+      filterRenderTimer = window.setTimeout(() => {
+        filterRenderTimer = null;
+        renderFilteredResults();
+      }, 120);
+    }
+
     function render() {
       const showLoading = (state.marketStatus === "loading" && !stocks.length)
         || (state.pageView === "midterm" && ["loading", "running"].includes(state.midtermScan?.status) && !state.midtermCandidates.length);
@@ -5660,11 +5684,20 @@
       if (event.key === "Escape" && state.chartOpen) requestChartClose();
     });
 
-    [el.strategy, el.sortBy, el.scoreRange, el.search].forEach((control) => {
+    [el.strategy, el.sortBy].forEach((control) => {
       control.addEventListener("input", () => {
         updateFromControls();
         state.listPage = 1;
         render();
+      });
+    });
+
+    [el.scoreRange, el.search].forEach((control) => {
+      control.addEventListener("input", () => {
+        updateFromControls();
+        state.listPage = 1;
+        if (control === el.scoreRange) el.scoreValue.textContent = state.minScore;
+        scheduleFilterRender();
       });
     });
 

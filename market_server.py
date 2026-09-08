@@ -43,6 +43,7 @@ HISTORY_DAYS = 400
 CACHE_TTL_SECONDS = 20
 INTRADAY_CACHE_TTL_SECONDS = 300
 DYNAMIC_CACHE_TTL_SECONDS = 30
+MARKET_ROWS_CACHE_TTL_SECONDS = 25
 STOCK_CACHE_TTL_SECONDS = 300
 DOWNTREND_HISTORY_DAYS = 90
 DOWNTREND_MIN_HISTORY_DAYS = 25
@@ -118,6 +119,11 @@ HOT_CONCEPT_FIXED_BOARDS: Dict[str, Tuple[str, str]] = {
 # It must print an EMT get_open_call_auction JSON result for the whole A-share universe.
 # Example: EMT_AUCTION_COMMAND='python3 /path/to/export_emt_auction.py --date {date}'
 EMT_AUCTION_COMMAND = os.environ.get("EMT_AUCTION_COMMAND", "").strip()
+ENABLE_ALL_MARKET_BACKTEST = os.environ.get("ENABLE_ALL_MARKET_BACKTEST", "").strip().lower() in ("1", "true", "yes")
+_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://finance.sina.com.cn/",
+}
 AUCTION_CAPTURE_WINDOW_START = (9, 25, 0)
 AUCTION_CAPTURE_WINDOW_END = (9, 30, 0)
 
@@ -261,6 +267,7 @@ _cache_lock = threading.Lock()
 _cache: Dict[str, Dict[str, Any]] = {}
 _intraday_cache: Dict[str, Dict[str, Any]] = {}
 _dynamic_cache: Dict[str, Dict[str, Any]] = {}
+_market_rows_cache: Dict[str, Dict[str, Any]] = {}
 _sector_strength_cache: Dict[str, Dict[str, Any]] = {}
 _stock_cache: Dict[str, Dict[str, Any]] = {}
 _downtrend_history_cache: Dict[str, Dict[str, Any]] = {}
@@ -591,72 +598,43 @@ def auction_strength_score(auction: Optional[Dict[str, Any]], float_cap: Optiona
     }
 
 
+def fetch_url_bytes(
+    url: str,
+    *,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    headers: Optional[Dict[str, str]] = None,
+    data: Optional[bytes] = None,
+    method: Optional[str] = None,
+) -> bytes:
+    request_headers = {**_HTTP_HEADERS, **(headers or {})}
+    request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = response.read()
+    if not payload:
+        raise MarketDataError("空响应")
+    return payload
+
+
 def request_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     full_url = f"{url}?{urlencode(params, safe=',')}"
     try:
-        result = subprocess.run(
-            [
-                "curl",
-                "-fsSL",
-                "--max-time",
-                str(REQUEST_TIMEOUT_SECONDS),
-                "--retry",
-                "2",
-                "--retry-delay",
-                "0",
-                full_url,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=REQUEST_TIMEOUT_SECONDS + 2,
-        )
-        if not result.stdout:
-            raise MarketDataError("空响应")
-        return json.loads(result.stdout.decode("utf-8"))
-    except (
-        FileNotFoundError,
-        subprocess.CalledProcessError,
-        subprocess.TimeoutExpired,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-    ) as exc:
+        return json.loads(fetch_url_bytes(full_url).decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MarketDataError(f"行情服务请求失败: {exc}") from exc
 
 
 def request_json_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
     try:
-        result = subprocess.run(
-            [
-                "curl",
-                "-fsSL",
-                "--max-time",
-                str(REQUEST_TIMEOUT_SECONDS),
-                "--retry",
-                "2",
-                "--retry-delay",
-                "0",
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/json",
-                "--data",
-                json.dumps(payload, ensure_ascii=True),
+        return json.loads(
+            fetch_url_bytes(
                 url,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=REQUEST_TIMEOUT_SECONDS + 2,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            ).decode("utf-8")
         )
-        if not result.stdout:
-            raise MarketDataError("空响应")
-        return json.loads(result.stdout.decode("utf-8"))
-    except (
-        FileNotFoundError,
-        subprocess.CalledProcessError,
-        subprocess.TimeoutExpired,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-    ) as exc:
+    except (urllib.error.URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MarketDataError(f"概念数据请求失败: {exc}") from exc
 
 
@@ -1615,12 +1593,8 @@ def add_order_flow_factors(quotes: List[Dict[str, Any]], sectors: List[Dict[str,
     for start in range(0, len(quotes), 60):
         symbols = ",".join(tencent_quote_symbol(item["code"]) for item in quotes[start:start + 60])
         try:
-            result = subprocess.run(
-                ["curl", "-fsSL", "--max-time", str(REQUEST_TIMEOUT_SECONDS), f"{TENCENT_BATCH_QUOTE_URL}{symbols}"],
-                check=True, capture_output=True, timeout=REQUEST_TIMEOUT_SECONDS + 2,
-            )
-            content = result.stdout.decode("gb18030", errors="replace")
-        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            content = fetch_url_bytes(f"{TENCENT_BATCH_QUOTE_URL}{symbols}").decode("gb18030", errors="replace")
+        except MarketDataError:
             continue
         for line in content.splitlines():
             if '="' not in line:
@@ -1757,11 +1731,11 @@ def aggregate_sector_strength(quotes: List[Dict[str, Any]]) -> List[Dict[str, An
     return sectors
 
 
-def fetch_market_rows(market_key: str) -> Tuple[List[Dict[str, Any]], int]:
+def fetch_market_rows(market_key: str, force_refresh: bool = False) -> Tuple[List[Dict[str, Any]], int]:
     if market_key == "all":
         rows_by_code: Dict[str, Dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=len(ALL_MARKET_SCOPE_KEYS)) as executor:
-            futures = [executor.submit(fetch_market_rows, key) for key in ALL_MARKET_SCOPE_KEYS]
+            futures = [executor.submit(fetch_market_rows, key, force_refresh) for key in ALL_MARKET_SCOPE_KEYS]
             for future in as_completed(futures):
                 rows, _ = future.result()
                 for row in rows:
@@ -1769,6 +1743,13 @@ def fetch_market_rows(market_key: str) -> Tuple[List[Dict[str, Any]], int]:
                     if code:
                         rows_by_code[code] = row
         return list(rows_by_code.values()), len(rows_by_code)
+
+    now = time.monotonic()
+    if not force_refresh:
+        with _cache_lock:
+            cached = _market_rows_cache.get(market_key)
+            if cached and now - cached["created_at"] < MARKET_ROWS_CACHE_TTL_SECONDS:
+                return list(cached["rows"]), int(cached["total"])
 
     market = MARKET_SCOPES[market_key]
     params = {
@@ -1797,6 +1778,8 @@ def fetch_market_rows(market_key: str) -> Tuple[List[Dict[str, Any]], int]:
             pages = executor.map(fetch_page, range(2, page_count + 1))
             for page_rows in pages:
                 rows.extend(page_rows)
+    with _cache_lock:
+        _market_rows_cache[market_key] = {"created_at": time.monotonic(), "rows": rows, "total": total}
     return rows, total
 
 
@@ -1940,9 +1923,10 @@ def get_hot_concept_summaries(names: List[str], force_refresh: bool = False) -> 
 def fetch_dynamic_market_data(
     market_key: str, min_amount: float, min_change: float, min_turnover: float, limit: int,
     include_all: bool = False,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     market = MARKET_SCOPES[market_key]
-    rows, total = fetch_market_rows(market_key)
+    rows, total = fetch_market_rows(market_key, force_refresh=force_refresh)
     updated_at = datetime.now(CHINA_TZ)
     quotes: List[Dict[str, Any]] = []
     market_quotes: List[Dict[str, Any]] = []
@@ -2055,7 +2039,9 @@ def get_dynamic_market_data(
         if cached and now - cached["created_at"] < DYNAMIC_CACHE_TTL_SECONDS and not force_refresh:
             return cached["payload"]
 
-    payload = fetch_dynamic_market_data(market_key, min_amount, min_change, min_turnover, limit, include_all)
+    payload = fetch_dynamic_market_data(
+        market_key, min_amount, min_change, min_turnover, limit, include_all, force_refresh=force_refresh
+    )
     with _cache_lock:
         _dynamic_cache[cache_key] = {"created_at": time.monotonic(), "payload": payload}
     return payload
@@ -2368,20 +2354,8 @@ def fetch_midterm_activity_history(code: str, signal_year: int) -> List[Dict[str
     }
     full_url = f"{SOHU_HISTORY_URL}?{urlencode(params, safe=',')}"
     try:
-        result = subprocess.run(
-            ["curl", "-fsSL", "--max-time", str(REQUEST_TIMEOUT_SECONDS), "--retry", "2", "--retry-delay", "0", full_url],
-            check=True,
-            capture_output=True,
-            timeout=REQUEST_TIMEOUT_SECONDS + 2,
-        )
-        payload = json.loads(result.stdout.decode("gb18030"))
-    except (
-        FileNotFoundError,
-        subprocess.CalledProcessError,
-        subprocess.TimeoutExpired,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-    ) as exc:
+        payload = json.loads(fetch_url_bytes(full_url).decode("gb18030"))
+    except (MarketDataError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MarketDataError(f"搜狐历史行情请求失败: {exc}") from exc
     rows: List[Dict[str, Any]] = []
     source_rows = payload[0].get("hq") if isinstance(payload, list) and payload else []
@@ -3077,6 +3051,17 @@ def run_all_market_backtest() -> None:
 
 def all_market_backtest_loop(stop_event: threading.Event) -> None:
     """Run the initial full-market job once after service startup."""
+    global _all_market_backtest_status
+    if not ENABLE_ALL_MARKET_BACKTEST:
+        _all_market_backtest_status = {
+            "status": "disabled",
+            "total": 0,
+            "processed": 0,
+            "records": 0,
+            "failed": 0,
+            "message": "未启用；设置 ENABLE_ALL_MARKET_BACKTEST=1 后重启可后台建立全市场回测样本",
+        }
+        return
     if stop_event.wait(3):
         return
     run_all_market_backtest()
@@ -3619,7 +3604,10 @@ def main() -> None:
     else:
         print("EMT 竞价采集未配置：涨停复盘将把竞价委买因子标为待接入")
     print("后续上涨模型将在交易日 15:05 后保存当日候选，并在满 10 个交易日后自动校准")
-    print("全市场历史回测已在后台启动：已完成股票将自动跳过，支持断点续跑")
+    if ENABLE_ALL_MARKET_BACKTEST:
+        print("全市场历史回测已在后台启动：已完成股票将自动跳过，支持断点续跑")
+    else:
+        print("全市场历史回测默认关闭：如需后台建立样本，请设置 ENABLE_ALL_MARKET_BACKTEST=1")
     print("按 Ctrl+C 停止服务")
     try:
         server.serve_forever()
