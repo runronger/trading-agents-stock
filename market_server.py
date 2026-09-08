@@ -449,8 +449,10 @@ def capture_emt_auction_snapshot(trade_date: str) -> Dict[str, Any]:
     if not command:
         return {"available": False, "status": "unconfigured", "records": {}, "message": "EMT_AUCTION_COMMAND 为空"}
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=45)
-        records = normalize_auction_records(json.loads(result.stdout), trade_date)
+        result = subprocess.run(command, check=True, capture_output=True, timeout=45)
+        if not result.stdout:
+            raise MarketDataError("EMT 导出程序未返回数据")
+        records = normalize_auction_records(json.loads(result.stdout.decode("utf-8")), trade_date)
         AUCTION_DATA_DIR.mkdir(parents=True, exist_ok=True)
         snapshot = {
             "marketDate": trade_date,
@@ -606,14 +608,16 @@ def request_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
             ],
             check=True,
             capture_output=True,
-            text=True,
             timeout=REQUEST_TIMEOUT_SECONDS + 2,
         )
-        return json.loads(result.stdout)
+        if not result.stdout:
+            raise MarketDataError("空响应")
+        return json.loads(result.stdout.decode("utf-8"))
     except (
         FileNotFoundError,
         subprocess.CalledProcessError,
         subprocess.TimeoutExpired,
+        UnicodeDecodeError,
         json.JSONDecodeError,
     ) as exc:
         raise MarketDataError(f"行情服务请求失败: {exc}") from exc
@@ -641,14 +645,16 @@ def request_json_post(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             ],
             check=True,
             capture_output=True,
-            text=True,
             timeout=REQUEST_TIMEOUT_SECONDS + 2,
         )
-        return json.loads(result.stdout)
+        if not result.stdout:
+            raise MarketDataError("空响应")
+        return json.loads(result.stdout.decode("utf-8"))
     except (
         FileNotFoundError,
         subprocess.CalledProcessError,
         subprocess.TimeoutExpired,
+        UnicodeDecodeError,
         json.JSONDecodeError,
     ) as exc:
         raise MarketDataError(f"概念数据请求失败: {exc}") from exc
